@@ -1,3 +1,4 @@
+"""
 Actualiza el historico de VCP (Valor de Cuotaparte) de un conjunto fijo de FCI,
 bajando todos los dias la planilla publica de CAFCI y agregando las filas nuevas
 a un archivo historico.csv (formato largo: fondo, fecha, vcp).
@@ -110,7 +111,7 @@ def extraer_fondos_de_interes(df: pd.DataFrame) -> pd.DataFrame:
             filas.append({
                 "fondo": nombre_original,
                 "fecha": row[COL_FECHA],
-                "vcp": row[COL_VCP]/1000,
+                "vcp": row[COL_VCP] / 1000,
             })
             encontrados.add(nombre_original)
 
@@ -130,7 +131,6 @@ def actualizar_historico(nuevas_filas: pd.DataFrame):
         print("No se encontraron filas de los fondos de interes en la planilla de hoy. No se actualiza nada.")
         return
 
-    
     nuevas_filas["fecha"] = pd.to_datetime(nuevas_filas["fecha"], format="mixed", dayfirst=True).dt.date
 
     if HISTORICO_CSV.exists():
@@ -157,5 +157,6 @@ if __name__ == "__main__":
 
     df_interes = extraer_fondos_de_interes(df_planilla)
     print(f"Fondos de interes encontrados hoy: {len(df_interes)}")
+    print("Fechas encontradas:", df_interes["fecha"].unique())
 
     actualizar_historico(df_interes)
