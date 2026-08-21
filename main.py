@@ -3,32 +3,31 @@ Backend en FastAPI para el dashboard de fondos + CEDEARs.
 
 Endpoints:
   GET  /                 -> visor simple en HTML, con boton "Actualizar ahora"
-  GET  /api/fondos       -> historico de los fondos (JSON)
-  GET  /api/cedears      -> historico de CEDEARs/ETFs (JSON)
-  POST /api/actualizar   -> fuerza una relectura de los CSV locales (por si
-                             se subio una version nueva a mano)
+  GET  /api/fondos       -> ultimo historico "publicado" (JSON)
+  GET  /api/cedears      -> ultima serie "publicada" (JSON)
+  POST /api/actualizar   -> trae la version MAS RECIENTE de GitHub y la
+                             "publica" -- esto es lo unico que actualiza lo
+                             que se muestra. Si no se aprieta, se sigue
+                             viendo la misma foto de la ultima vez, aunque
+                             pasen varios dias y el cron haya seguido
+                             guardando en silencio.
 
-FONDOS y CEDEARS se leen de archivos LOCALES (historico.csv y
-cedears_historico.csv) que tienen que estar en la raiz de este mismo repo.
+IMPORTANTE: los datos NUNCA se cargan solos, ni al arrancar el servicio
+ni en ningun redeploy -- la UNICA forma de que se actualice lo publicado
+es apretando el boton "Actualizar ahora" (que llama a POST /api/actualizar).
+Por eso no hace falta tocar el Auto-Deploy de Render: el resto del
+dashboard puede seguir redeployando normalmente con cada cambio de codigo,
+sin que eso dispare una publicacion de datos nueva aca.
 
-Esos 2 archivos se actualizan SOLOS todos los dias, via GitHub Actions
-(ver .github/workflows/actualizar_diario.yml), que hace commit + push al
-repo. Como Render esta configurado para redeployar en cada push, cada
-actualizacion diaria dispara un redeploy automatico -- y como esta app
-carga los CSV al arrancar (ver evento de "startup" mas abajo), los datos
-quedan al dia sin que nadie tenga que apretar nada.
-
-El boton "Actualizar ahora" sigue disponible por si se quiere forzar una
-relectura sin esperar al proximo redeploy (por ejemplo, si se subio un
-archivo a mano).
-
-Requiere: fastapi uvicorn pandas
+Requiere: fastapi uvicorn pandas requests
 """
 
+import os
 from datetime import datetime
-from pathlib import Path
+from io import StringIO
 
 import pandas as pd
+import requests
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -42,8 +41,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HISTORICO_FONDOS = Path("historico.csv")
-HISTORICO_CEDEARS = Path("cedears_historico.csv")
+# Se puede cambiar sin tocar el codigo, via variable de entorno en Render
+# (asi cada quien apunta a su propio repo sin modificar main.py)
+REPO_RAW_BASE = os.environ.get(
+    "REPO_RAW_BASE",
+    "https://raw.githubusercontent.com/agusstinamansilla/historicobackend/main",
+)
+HISTORICO_FONDOS_URL = f"{REPO_RAW_BASE}/historico.csv"
+HISTORICO_CEDEARS_URL = f"{REPO_RAW_BASE}/cedears_historico.csv"
 
 estado = {
     "fondos": None,
@@ -52,46 +57,42 @@ estado = {
 }
 
 
-def cargar_datos():
+def publicar():
+    """Trae la version mas reciente de GitHub y la 'publica' (unico lugar
+    donde estado[] cambia). Se llama al arrancar UNA vez, y despues solo
+    cuando se aprieta el boton."""
     resultado = {"fondos": None, "cedears": None}
 
-    if HISTORICO_FONDOS.exists():
-        try:
-            estado["fondos"] = pd.read_csv(HISTORICO_FONDOS)
-            resultado["fondos"] = {"ok": True, "filas": len(estado["fondos"])}
-        except Exception as e:
-            resultado["fondos"] = {"ok": False, "error": str(e)}
-    else:
-        resultado["fondos"] = {"ok": False, "error": f"No se encontro {HISTORICO_FONDOS}"}
+    try:
+        resp = requests.get(HISTORICO_FONDOS_URL, timeout=30)
+        resp.raise_for_status()
+        estado["fondos"] = pd.read_csv(StringIO(resp.text))
+        resultado["fondos"] = {"ok": True, "filas": len(estado["fondos"])}
+    except Exception as e:
+        resultado["fondos"] = {"ok": False, "error": str(e)}
 
-    if HISTORICO_CEDEARS.exists():
-        try:
-            estado["cedears"] = pd.read_csv(HISTORICO_CEDEARS)
-            resultado["cedears"] = {"ok": True, "filas": len(estado["cedears"])}
-        except Exception as e:
-            resultado["cedears"] = {"ok": False, "error": str(e)}
-    else:
-        resultado["cedears"] = {"ok": False, "error": f"No se encontro {HISTORICO_CEDEARS}"}
+    try:
+        resp = requests.get(HISTORICO_CEDEARS_URL, timeout=30)
+        resp.raise_for_status()
+        estado["cedears"] = pd.read_csv(StringIO(resp.text))
+        resultado["cedears"] = {"ok": True, "filas": len(estado["cedears"])}
+    except Exception as e:
+        resultado["cedears"] = {"ok": False, "error": str(e)}
 
     estado["ultima_actualizacion"] = datetime.now().isoformat()
     resultado["actualizado"] = estado["ultima_actualizacion"]
     return resultado
 
 
-@app.on_event("startup")
-def cargar_al_arrancar():
-    cargar_datos()
-
-
 @app.post("/api/actualizar")
 def actualizar():
-    return cargar_datos()
+    return publicar()
 
 
 @app.get("/api/fondos")
 def get_fondos():
     if estado["fondos"] is None:
-        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos cargados"}
+        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos publicados todavia"}
     return {
         "datos": estado["fondos"].to_dict(orient="records"),
         "ultima_actualizacion": estado["ultima_actualizacion"],
@@ -101,7 +102,7 @@ def get_fondos():
 @app.get("/api/cedears")
 def get_cedears():
     if estado["cedears"] is None:
-        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos cargados"}
+        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos publicados todavia"}
     return {
         "datos": estado["cedears"].to_dict(orient="records"),
         "ultima_actualizacion": estado["ultima_actualizacion"],
@@ -130,11 +131,11 @@ def visor():
 <body>
   <h1>Backend fondos + cedears</h1>
   <div class="card">
-    Fondos: {fondos_count} filas &middot; CEDEARs: {cedears_count} filas<br>
-    Ultima carga: {estado["ultima_actualizacion"] or "nunca"}<br>
-    <small>Se actualiza solo todos los dias a las 9am (GitHub Actions). Este boton solo fuerza una relectura manual.</small>
+    Publicado ahora: {fondos_count} filas de fondos &middot; {cedears_count} filas de cedears<br>
+    Ultima publicacion: {estado["ultima_actualizacion"] or "nunca"}<br>
+    <small>El cron guarda datos nuevos todos los dias en GitHub, pero ESTO solo se actualiza al apretar el boton.</small>
   </div>
-  <button onclick="actualizar()">Forzar relectura ahora</button>
+  <button onclick="actualizar()">Actualizar ahora</button>
   <div id="resultado"></div>
   <p>Endpoints: <a href="/api/fondos">/api/fondos</a> &middot; <a href="/api/cedears">/api/cedears</a> &middot; <a href="/docs">/docs</a></p>
   <script>
