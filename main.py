@@ -3,27 +3,32 @@ Backend en FastAPI para el dashboard de fondos + CEDEARs.
 
 Endpoints:
   GET  /                 -> visor simple en HTML, con boton "Actualizar ahora"
-  GET  /api/fondos       -> ultimo historico de los fondos (JSON)
-  GET  /api/cedears      -> ultima serie completa de CEDEARs/ETFs (JSON)
-  POST /api/actualizar   -> dispara la actualizacion (fondos + cedears)
+  GET  /api/fondos       -> historico de los fondos (JSON)
+  GET  /api/cedears      -> historico de CEDEARs/ETFs (JSON)
+  POST /api/actualizar   -> fuerza una relectura de los CSV locales (por si
+                             se subio una version nueva a mano)
 
-FONDOS: se leen de un archivo LOCAL "historico.csv" que tiene que estar
-subido en la raiz de este mismo repo (al lado de main.py). No se conecta
-a ningun GitHub externo -- quien deploye este backend controla sus propios
-datos subiendo su propia version de historico.csv.
+FONDOS y CEDEARS se leen de archivos LOCALES (historico.csv y
+cedears_historico.csv) que tienen que estar en la raiz de este mismo repo.
 
-CEDEARS: se descarga la serie COMPLETA de cada ticker desde Yahoo Finance
-cada vez que se aprieta "Actualizar" (se pisa entera, por los dividendos).
+Esos 2 archivos se actualizan SOLOS todos los dias, via GitHub Actions
+(ver .github/workflows/actualizar_diario.yml), que hace commit + push al
+repo. Como Render esta configurado para redeployar en cada push, cada
+actualizacion diaria dispara un redeploy automatico -- y como esta app
+carga los CSV al arrancar (ver evento de "startup" mas abajo), los datos
+quedan al dia sin que nadie tenga que apretar nada.
 
-Requiere: fastapi uvicorn pandas yfinance
+El boton "Actualizar ahora" sigue disponible por si se quiere forzar una
+relectura sin esperar al proximo redeploy (por ejemplo, si se subio un
+archivo a mano).
+
+Requiere: fastapi uvicorn pandas
 """
 
-import os
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-import yfinance as yf
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -37,10 +42,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Archivo local con el historico de fondos (subilo junto a main.py en el repo)
-HISTORICO_CSV_LOCAL = Path("historico.csv")
-
-TICKERS_CEDEARS = os.environ.get("TICKERS_CEDEARS", "VIG,GLD,SPY,QQQ,IBIT,TQQQ").split(",")
+HISTORICO_FONDOS = Path("historico.csv")
+HISTORICO_CEDEARS = Path("cedears_historico.csv")
 
 estado = {
     "fondos": None,
@@ -49,76 +52,46 @@ estado = {
 }
 
 
-def descargar_ticker_yahoo(ticker: str):
-    """Devuelve (dataframe, error). Si error no es None, dataframe es None."""
-    try:
-        df = yf.download(
-            ticker, period="max", interval="1d", auto_adjust=True,
-            progress=False, threads=False,
-        )
-        if df.empty:
-            return None, "yfinance devolvio un dataframe vacio (posible bloqueo de Yahoo a IPs de datacenter, o ticker invalido)"
-
-        if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
-            df.columns = [c[0] for c in df.columns]
-
-        df = df[["Open", "High", "Low", "Close"]].copy()
-        df = df.reset_index()
-        df.columns = ["fecha", "open", "high", "low", "close"]
-        df["fecha"] = pd.to_datetime(df["fecha"]).dt.strftime("%Y-%m-%d")
-        df["ticker"] = ticker
-        for col in ["open", "high", "low", "close"]:
-            df[col] = df[col].round(4)
-        return df[["ticker", "fecha", "open", "high", "low", "close"]], None
-    except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
-
-
-@app.post("/api/actualizar")
-def actualizar():
+def cargar_datos():
     resultado = {"fondos": None, "cedears": None}
 
-    # --- Fondos: leer el archivo local (subido en el repo) ---
-    try:
-        if not HISTORICO_CSV_LOCAL.exists():
-            resultado["fondos"] = {"ok": False, "error": f"No se encontro {HISTORICO_CSV_LOCAL} en el repo. Subilo junto a main.py."}
-        else:
-            df_fondos = pd.read_csv(HISTORICO_CSV_LOCAL)
-            estado["fondos"] = df_fondos
-            resultado["fondos"] = {"ok": True, "filas": len(df_fondos)}
-    except Exception as e:
-        resultado["fondos"] = {"ok": False, "error": str(e)}
+    if HISTORICO_FONDOS.exists():
+        try:
+            estado["fondos"] = pd.read_csv(HISTORICO_FONDOS)
+            resultado["fondos"] = {"ok": True, "filas": len(estado["fondos"])}
+        except Exception as e:
+            resultado["fondos"] = {"ok": False, "error": str(e)}
+    else:
+        resultado["fondos"] = {"ok": False, "error": f"No se encontro {HISTORICO_FONDOS}"}
 
-    # --- CEDEARs: descargar serie completa de cada ticker desde Yahoo ---
-    partes = []
-    errores_por_ticker = {}
-    for ticker in TICKERS_CEDEARS:
-        ticker = ticker.strip()
-        df_t, err = descargar_ticker_yahoo(ticker)
-        if err:
-            errores_por_ticker[ticker] = err
-        else:
-            partes.append(df_t)
-
-    if partes:
-        estado["cedears"] = pd.concat(partes, ignore_index=True)
-
-    resultado["cedears"] = {
-        "ok": len(partes) > 0,
-        "filas": len(estado["cedears"]) if estado["cedears"] is not None else 0,
-        "tickers_ok": [p["ticker"].iloc[0] for p in partes],
-        "tickers_fallidos": errores_por_ticker,
-    }
+    if HISTORICO_CEDEARS.exists():
+        try:
+            estado["cedears"] = pd.read_csv(HISTORICO_CEDEARS)
+            resultado["cedears"] = {"ok": True, "filas": len(estado["cedears"])}
+        except Exception as e:
+            resultado["cedears"] = {"ok": False, "error": str(e)}
+    else:
+        resultado["cedears"] = {"ok": False, "error": f"No se encontro {HISTORICO_CEDEARS}"}
 
     estado["ultima_actualizacion"] = datetime.now().isoformat()
     resultado["actualizado"] = estado["ultima_actualizacion"]
     return resultado
 
 
+@app.on_event("startup")
+def cargar_al_arrancar():
+    cargar_datos()
+
+
+@app.post("/api/actualizar")
+def actualizar():
+    return cargar_datos()
+
+
 @app.get("/api/fondos")
 def get_fondos():
     if estado["fondos"] is None:
-        return {"datos": [], "ultima_actualizacion": None, "aviso": "Todavia no se aprieta 'Actualizar'"}
+        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos cargados"}
     return {
         "datos": estado["fondos"].to_dict(orient="records"),
         "ultima_actualizacion": estado["ultima_actualizacion"],
@@ -128,7 +101,7 @@ def get_fondos():
 @app.get("/api/cedears")
 def get_cedears():
     if estado["cedears"] is None:
-        return {"datos": [], "ultima_actualizacion": None, "aviso": "Todavia no se aprieta 'Actualizar'"}
+        return {"datos": [], "ultima_actualizacion": None, "aviso": "Sin datos cargados"}
     return {
         "datos": estado["cedears"].to_dict(orient="records"),
         "ultima_actualizacion": estado["ultima_actualizacion"],
@@ -139,7 +112,6 @@ def get_cedears():
 def visor():
     fondos_count = len(estado["fondos"]) if estado["fondos"] is not None else 0
     cedears_count = len(estado["cedears"]) if estado["cedears"] is not None else 0
-    archivo_local_existe = HISTORICO_CSV_LOCAL.exists()
     return f"""
 <!DOCTYPE html>
 <html lang="es">
@@ -153,22 +125,21 @@ def visor():
     button {{ background:#3de8a0; border:none; padding:10px 18px; border-radius:8px; cursor:pointer; font-weight:bold; font-size:14px; }}
     #resultado {{ white-space: pre-wrap; font-family: monospace; font-size:12px; margin-top:16px; }}
     a {{ color:#3de8a0; }}
-    .aviso {{ color: {"#3DE8A0" if archivo_local_existe else "#FF7A68"}; }}
   </style>
 </head>
 <body>
   <h1>Backend fondos + cedears</h1>
   <div class="card">
-    Archivo historico.csv en el repo: <span class="aviso">{"encontrado" if archivo_local_existe else "NO ENCONTRADO -- subilo junto a main.py"}</span><br>
-    Estado actual: fondos = {fondos_count} filas, cedears = {cedears_count} filas<br>
-    Ultima actualizacion: {estado["ultima_actualizacion"] or "nunca"}
+    Fondos: {fondos_count} filas &middot; CEDEARs: {cedears_count} filas<br>
+    Ultima carga: {estado["ultima_actualizacion"] or "nunca"}<br>
+    <small>Se actualiza solo todos los dias a las 9am (GitHub Actions). Este boton solo fuerza una relectura manual.</small>
   </div>
-  <button onclick="actualizar()">Actualizar ahora</button>
+  <button onclick="actualizar()">Forzar relectura ahora</button>
   <div id="resultado"></div>
   <p>Endpoints: <a href="/api/fondos">/api/fondos</a> &middot; <a href="/api/cedears">/api/cedears</a> &middot; <a href="/docs">/docs</a></p>
   <script>
     async function actualizar() {{
-      document.getElementById('resultado').textContent = 'Actualizando... puede tardar unos segundos';
+      document.getElementById('resultado').textContent = 'Actualizando...';
       const r = await fetch('/api/actualizar', {{ method: 'POST' }});
       const j = await r.json();
       document.getElementById('resultado').textContent = JSON.stringify(j, null, 2);
